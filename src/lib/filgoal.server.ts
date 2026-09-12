@@ -100,6 +100,19 @@ export type MatchEvent = {
   relatedPlayer: string | null;
 };
 
+export type StatRow = {
+  key: string;
+  label: string;
+  home: number;
+  away: number;
+  unit: "percent" | "count";
+};
+
+export type MatchStats = {
+  possession: { home: number; away: number } | null;
+  rows: StatRow[];
+};
+
 export type MatchDetail = Match & {
   referee: string | null;
   stadium: string | null;
@@ -109,6 +122,7 @@ export type MatchDetail = Match & {
   awayFormation: string | null;
   tvChannels: string[];
   events: MatchEvent[];
+  stats: MatchStats;
   lineups: {
     home: LineupPlayer[];
     away: LineupPlayer[];
@@ -479,6 +493,12 @@ export function parseMatchDetail(html: string): MatchDetail | null {
       String((raw as Record<string, never>)["TvChannelName"] ?? ""),
     ),
     events,
+    stats: deriveStats(
+      commentary,
+      events,
+      String(get<string>("HomeTeamName") ?? ""),
+      String(get<string>("AwayTeamName") ?? ""),
+    ),
     lineups: {
       home: mapSquad(get<unknown[]>("HomeTeamSquad") ?? []),
       away: mapSquad(get<unknown[]>("AwayTeamSquad") ?? []),
@@ -488,6 +508,134 @@ export function parseMatchDetail(html: string): MatchDetail | null {
     commentary,
   };
 }
+
+/* ------------------------- إحصائيات المباراة (استنتاج) ------------------------ */
+
+/** يطابق اسم فريق داخل نص التعليق (بالاسم الكامل أو أطول كلمة مميزة فيه). */
+const teamMatcher = (name: string) => {
+  const clean = name.replace(/منتخب|نادي/g, "").trim();
+  const tokens = clean.split(/\s+/).filter((t) => t.length >= 4);
+  return (text: string) =>
+    (clean.length > 2 && text.includes(clean)) || tokens.some((t) => text.includes(t));
+};
+
+/**
+ * "في الجول" ما بيوفرش جدول إحصائيات جاهز، فبنستنتجه من التعليق الحي
+ * (الاستحواذ بيتنشر كنص) ومن أحداث المباراة (البطاقات والتبديلات).
+ */
+export function deriveStats(
+  commentary: { minute: number | null; text: string }[],
+  events: MatchEvent[],
+  homeName: string,
+  awayName: string,
+): MatchStats {
+  const isHome = teamMatcher(homeName);
+  const isAway = teamMatcher(awayName);
+
+  // آخر سطر استحواذ في التعليق: "الاستحواذ : 42% فريق أ مقابل 58% فريق ب."
+  let possession: MatchStats["possession"] = null;
+  for (const c of commentary) {
+    if (!c.text.includes("الاستحواذ")) continue;
+    const parts = [...c.text.matchAll(/(\d{1,3})\s*%\s*([^%]*?)(?:مقابل|\.|$)/g)].map((m) => ({
+      value: Number(m[1]),
+      who: m[2] ?? "",
+    }));
+    if (parts.length < 2) continue;
+    const homePart = parts.find((p) => isHome(p.who));
+    const awayPart = parts.find((p) => isAway(p.who));
+    const next =
+      homePart && awayPart
+        ? { home: homePart.value, away: awayPart.value }
+        : { home: parts[0]!.value, away: parts[1]!.value };
+    if (next.home + next.away >= 95 && next.home + next.away <= 105) {
+      possession = next;
+      break; // التعليق مرتب من الأحدث للأقدم
+    }
+  }
+
+  const counters: Record<string, [number, number]> = {
+    shots: [0, 0],
+    onTarget: [0, 0],
+    corners: [0, 0],
+    fouls: [0, 0],
+    offsides: [0, 0],
+    saves: [0, 0],
+  };
+
+  const bump = (key: string, side: 0 | 1) => {
+    const row = counters[key];
+    if (row) row[side] += 1;
+  };
+
+  for (const c of commentary) {
+    const t = c.text;
+    const home = isHome(t);
+    const away = isAway(t);
+    const side: 0 | 1 | null = home && !away ? 0 : away && !home ? 1 : null;
+    if (side == null) continue;
+
+    if (/تسديدة|تسدد|كرة رأسية|رأسية من/.test(t)) {
+      bump("shots", side);
+      if (/تصدى|أنقذ|أمسك|القائم|العارضة|داخل الشباك|في الشباك|هدف/.test(t))
+        bump("onTarget", side);
+    }
+    if (/ركنية/.test(t)) bump("corners", side);
+    if (/تسلل/.test(t)) bump("offsides", side);
+    if (/خطأ/.test(t)) bump("fouls", side === 0 ? 1 : 0);
+    if (/تصدى|أنقذ|أمسك الحارس|تصدي/.test(t)) bump("saves", side === 0 ? 1 : 0);
+  }
+
+  const homeId = events.find((e) => e.teamName && isHome(e.teamName))?.teamId ?? null;
+  const eventSide = (e: MatchEvent): 0 | 1 | null => {
+    if (e.teamName) {
+      if (isHome(e.teamName)) return 0;
+      if (isAway(e.teamName)) return 1;
+    }
+    if (e.teamId != null && homeId != null) return e.teamId === homeId ? 0 : 1;
+    return null;
+  };
+
+  const cards: Record<string, [number, number]> = {
+    yellow: [0, 0],
+    red: [0, 0],
+    subs: [0, 0],
+  };
+  for (const e of events) {
+    const side = eventSide(e);
+    if (side == null) continue;
+    if (/yellow/i.test(e.type)) cards["yellow"]![side] += 1;
+    else if (/red/i.test(e.type)) cards["red"]![side] += 1;
+    else if (/substitution/i.test(e.type)) cards["subs"]![side] += 1;
+  }
+
+  const labels: { key: string; label: string; from: Record<string, [number, number]> }[] = [
+    { key: "shots", label: "التسديدات", from: counters },
+    { key: "onTarget", label: "تسديدات على الهدف", from: counters },
+    { key: "corners", label: "الركنيات", from: counters },
+    { key: "saves", label: "تصديات الحارس", from: counters },
+    { key: "fouls", label: "الأخطاء", from: counters },
+    { key: "offsides", label: "التسلل", from: counters },
+    { key: "yellow", label: "بطاقات صفراء", from: cards },
+    { key: "red", label: "بطاقات حمراء", from: cards },
+    { key: "subs", label: "التبديلات", from: cards },
+  ];
+
+  const rows: StatRow[] = labels
+    .map(({ key, label, from }) => {
+      const pair = from[key] ?? [0, 0];
+      return {
+        key,
+        label,
+        home: pair[0] ?? 0,
+        away: pair[1] ?? 0,
+        unit: "count" as const,
+      };
+    })
+    .filter((r) => r.home > 0 || r.away > 0);
+
+  return { possession, rows };
+}
+
 
 /** أخبار النادي من صفحة أخبار الفريق في "في الجول" (قائمة <li> داخل main). */
 export function parseFilGoalNews(html: string): NewsItem[] {
