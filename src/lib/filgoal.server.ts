@@ -100,6 +100,19 @@ export type MatchEvent = {
   relatedPlayer: string | null;
 };
 
+export type StatRow = {
+  key: string;
+  label: string;
+  home: number;
+  away: number;
+  unit: "percent" | "count";
+};
+
+export type MatchStats = {
+  possession: { home: number; away: number } | null;
+  rows: StatRow[];
+};
+
 export type MatchDetail = Match & {
   referee: string | null;
   stadium: string | null;
@@ -109,6 +122,7 @@ export type MatchDetail = Match & {
   awayFormation: string | null;
   tvChannels: string[];
   events: MatchEvent[];
+  stats: MatchStats;
   lineups: {
     home: LineupPlayer[];
     away: LineupPlayer[];
